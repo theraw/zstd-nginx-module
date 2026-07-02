@@ -8,6 +8,15 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#include <zstd.h>     /* ZSTD_MAGICNUMBER, ZSTD_MAGIC_SKIPPABLE_* — stable since 0.8.0 */
+#include <stdint.h>   /* uint32_t for the magic-number compare */
+
+#if !(NGX_WIN32)
+#include <unistd.h>   /* pread(2) for the magic-number probe */
+#endif
+
+#include "../ngx_http_zstd_common.h"
+
 
 #define NGX_HTTP_ZSTD_STATIC_OFF        0
 #define NGX_HTTP_ZSTD_STATIC_ON         1
@@ -40,8 +49,6 @@ static ngx_command_t  ngx_http_zstd_static_commands[] = {
 
 
 static ngx_int_t ngx_http_zstd_static_handler(ngx_http_request_t *r);
-static ngx_int_t ngx_http_zstd_accept_encoding(ngx_str_t *ae);
-static ngx_int_t ngx_http_zstd_ok(ngx_http_request_t *r);
 static void * ngx_http_zstd_static_create_loc_conf(ngx_conf_t *cf);
 static char * ngx_http_zstd_static_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -58,7 +65,7 @@ static ngx_http_module_t  ngx_http_zstd_static_module_ctx = {
     NULL,                                     /* create server configuration */
     NULL,                                     /* merge server configuration */
 
-    ngx_http_zstd_static_create_loc_conf,     /* create location configuration */
+    ngx_http_zstd_static_create_loc_conf,  /* create location configuration */
     ngx_http_zstd_static_merge_loc_conf,      /* merge location configuration */
 };
 
@@ -99,7 +106,9 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    if (r->uri.data[r->uri.len - 1] == '/') {
+    /* Validate URI length before accessing last byte to prevent underflow.
+     * While nginx guarantees non-empty URI, add defensive check for safety. */
+    if (r->uri.len == 0 || r->uri.data[r->uri.len - 1] == '/') {
         return NGX_DECLINED;
     }
 
@@ -118,13 +127,16 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
 
+    log = r->connection->log;
+
     if (!clcf->gzip_vary && rc != NGX_OK) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, log, 0,
+                       "zstd static: skip, client did not accept zstd and "
+                       "gzip_vary is off");
         return NGX_DECLINED;
     }
 
-    log = r->connection->log;
-
-    p = ngx_http_map_uri_to_path(r, &path, &root, sizeof(".zst") - 1);
+    p = ngx_http_map_uri_to_path(r, &path, &root, sizeof(".zst"));
     if (p == NULL) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
@@ -212,6 +224,73 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
         return NGX_HTTP_NOT_FOUND;
     }
 
+#if (NGX_HAVE_PREAD)
+    /*
+     * Magic-number sanity check on the .zst file.
+     *
+     * Without this, a truncated, half-downloaded, mistakenly-renamed
+     * (e.g. `cp foo.txt foo.zst`), or otherwise non-zstd file would be
+     * served with `Content-Encoding: zstd` and the client would get an
+     * undecodable body — a confusing outage class that nginx's built-in
+     * gzip_static also doesn't defend against. The probe is cheap (one
+     * pread(2) of 4 bytes at offset 0; pread is offset-explicit so it
+     * never moves the open_file_cache's shared fd position — using
+     * plain read(2) would do exactly that and corrupt subsequent
+     * requests serving the same cached fd). On mismatch we decline, so
+     * nginx falls back to serving the uncompressed original (or
+     * returns 404 if it is absent), and the operator sees a clear
+     * error log line.
+     *
+     * Both a regular zstd frame (ZSTD_MAGICNUMBER) and a skippable
+     * frame (ZSTD_MAGIC_SKIPPABLE_START..+0xF) are accepted, since
+     * either is a valid leading frame in a zstd stream.
+     *
+     * Gated by NGX_HAVE_PREAD: on platforms where nginx's configure
+     * could not find pread(2) we silently skip the probe rather than
+     * fall back to a read+lseek pair that would mutate the shared fd
+     * offset. Every modern POSIX target has it; this guard is
+     * essentially a build-time tripwire.
+     */
+    if (of.size < 4) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "zstd static: \"%s\" too small to be a zstd frame "
+                      "(%O bytes)", path.data, of.size);
+        return NGX_DECLINED;
+    }
+
+    {
+        u_char    magic[4];
+        ssize_t   n;
+        uint32_t  mw;
+
+        n = pread(of.fd, magic, sizeof(magic), 0);
+        if (n != (ssize_t) sizeof(magic)) {
+            ngx_log_error(NGX_LOG_CRIT, log, ngx_errno,
+                          "zstd static: pread(\"%s\", 4 bytes) "
+                          "returned %z", path.data, n);
+            return NGX_DECLINED;
+        }
+
+        mw = ((uint32_t) magic[0])
+           | ((uint32_t) magic[1] << 8)
+           | ((uint32_t) magic[2] << 16)
+           | ((uint32_t) magic[3] << 24);
+
+        if (mw != ZSTD_MAGICNUMBER
+            && (mw & ZSTD_MAGIC_SKIPPABLE_MASK)
+               != ZSTD_MAGIC_SKIPPABLE_START)
+        {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "zstd static: \"%s\" is not a zstd frame "
+                          "(leading bytes 0x%02xd%02xd%02xd%02xd)",
+                          path.data,
+                          (ngx_uint_t) magic[0], (ngx_uint_t) magic[1],
+                          (ngx_uint_t) magic[2], (ngx_uint_t) magic[3]);
+            return NGX_DECLINED;
+        }
+    }
+#endif /* NGX_HAVE_PREAD */
+
 #endif
 
     r->root_tested = !r->error_page;
@@ -221,7 +300,7 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
         return rc;
     }
 
-    log->action = "sending response to client";
+    log->action = (char *) "sending response to client";
 
     r->headers_out.status = NGX_HTTP_OK;
     r->headers_out.content_length_n = of.size;
@@ -231,6 +310,10 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
+    /*
+     * ngx_http_set_content_type() uses r->exten which is derived from the
+     * original URI, not from path. No path manipulation is needed here.
+     */
     if (ngx_http_set_content_type(r) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
@@ -244,6 +327,15 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
     ngx_str_set(&h->key, "Content-Encoding");
     ngx_str_set(&h->value, "zstd");
     r->headers_out.content_encoding = h;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
+                   "zstd static: serving precompressed \"%s\"", path.data);
+
+    /* Byte ranges are meaningless on a compressed body: offsets in the
+     * .zst file do not correspond to positions in the original content.
+     * RFC 9110 §14.2 — clear Accept-Ranges so clients do not request
+     * ranges that would yield undecipherable fragments. */
+    ngx_http_clear_accept_ranges(r);
 
     b = ngx_calloc_buf(r->pool);
     if (b == NULL) {
@@ -280,67 +372,12 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
 }
 
 
-static ngx_int_t
-ngx_http_zstd_ok(ngx_http_request_t *r)
-{
-    ngx_table_elt_t  *ae;
-
-    if (r != r->main) {
-        return NGX_DECLINED;
-    }
-
-    ae = r->headers_in.accept_encoding;
-    if (ae == NULL) {
-        return NGX_DECLINED;
-    }
-
-    if (ae->value.len < sizeof("zstd") - 1) {
-        return NGX_DECLINED;
-    }
-
-    if (ngx_memcmp(ae->value.data, "zstd", 4) != 0
-        && ngx_http_zstd_accept_encoding(&ae->value) != NGX_OK)
-    {
-        return NGX_DECLINED;
-    }
-
-
-    r->gzip_tested = 1;
-    r->gzip_ok = 0;
-
-    return NGX_OK;
-}
-
-
-static ngx_int_t
-ngx_http_zstd_accept_encoding(ngx_str_t *ae)
-{
-    u_char  *p;
-
-    p = ngx_strcasestrn(ae->data, "zstd", sizeof("zstd") - 1);
-    if (p == NULL) {
-        return NGX_DECLINED;
-    }
-
-    if (p == ae->data || (*(p - 1) == ',' || *(p - 1) == ' ')) {
-
-        p += sizeof("zstd") - 1;
-
-        if (p == ae->data + ae->len || *p == ',' || *p == ' ' || *p == ';') {
-            return NGX_OK;
-        }
-    }
-
-    return NGX_DECLINED;
-}
-
-
 static void *
 ngx_http_zstd_static_create_loc_conf(ngx_conf_t *cf)
 {
     ngx_http_zstd_static_conf_t  *conf;
 
-    conf = ngx_palloc(cf->pool, sizeof(ngx_http_zstd_static_conf_t));
+    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_zstd_static_conf_t));
     if (conf == NULL) {
         return NULL;
     }
@@ -357,8 +394,36 @@ ngx_http_zstd_static_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_zstd_static_conf_t *prev = parent;
     ngx_http_zstd_static_conf_t *conf = child;
 
+    ngx_http_core_loc_conf_t    *clcf;
+
     ngx_conf_merge_uint_value(conf->enable, prev->enable,
                               NGX_HTTP_ZSTD_STATIC_OFF);
+
+    /*
+     * Warn at config load only when zstd_static is set to "on" (negotiated)
+     * for THIS location and the same location has gzip_vary off. The
+     * previous version emitted this warning unconditionally from the
+     * postconfiguration handler whenever the top-level location lacked
+     * gzip_vary, even on configs that load the module but never use
+     * the directive — a misleading log line. Mirror the filter
+     * module's per-location merge-time check.
+     *
+     * "always" is deliberately excluded: it ignores Accept-Encoding,
+     * intentionally does NOT set r->gzip_vary, and the response carries no
+     * Vary header — so asking the operator to add gzip_vary would describe
+     * the response incorrectly. See C5.
+     */
+    if (conf->enable == NGX_HTTP_ZSTD_STATIC_ON) {
+        clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+        if (clcf != NULL && !clcf->gzip_vary) {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "zstd_static is enabled but "
+                               "\"gzip_vary\" is off; add \"gzip_vary "
+                               "on\" to emit \"Vary: Accept-Encoding\" "
+                               "so proxies and CDNs cache compressed "
+                               "and uncompressed responses separately");
+        }
+    }
 
     return NGX_CONF_OK;
 }
